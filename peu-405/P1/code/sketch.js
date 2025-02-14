@@ -48,20 +48,6 @@ function isPerihelion(before, current, after) {
   return current < before && current < after;
 }
 
-// Computes mean precession from perihelion angles
-function meanPrecession(perihelionList) {
-  if (perihelionList.length < 2) return 0;
-  // consecutive differences in angles
-  let differences = [];
-  for (let i = 0; i < perihelionList.length - 1; i++) {
-    let diff = perihelionList[i + 1][2] - perihelionList[i][2];
-    differences.push(diff);
-  }
-  // average difference minus one full orbit (2π in radians)
-  let avgDiff = differences.reduce((a, b) => a + b, 0) / differences.length;
-  return avgDiff - 2 * Math.PI;
-}
-
 // Download the entire trajectory table
 function downloadTrajectoryTable() {
   saveTable(table.getTable(), "schwarzschild_orbit_trajectory.csv");
@@ -154,21 +140,72 @@ function rk4Step(r, v, phi, dtau, l) {
 // 3) Integrate for `steps` iterations
 function integrateOrbit(r0, v0, phi0, steps, dtau, l) {
   let orbit = [];
-  let r = r0;
-  let v = v0;
-  let phi = phi0;
-  // push initial point
-  orbit.push([r, v, phi]);
+  perihelions = []; // reset perihelion array
+  table.clear(); // clear table before starting
+  circles = []; // clear circles array
 
-  for (let i = 1; i < steps; i++) {
-    [r, v, phi] = rk4Step(r, v, phi, dtau, l);
-    // optional: stop if r < 2 or too large
-    if (r < 2 || r > 1e6) {
+  // Variables for on-the-fly mean precession computation
+  let precessionSum = 0;
+  let precessionCount = 0;
+  let lastPerihelionPhi = null; // will store the last detected perihelion's phi
+
+  // Push the initial state
+  orbit.push([r0, v0, phi0]);
+  let x = r0 * Math.cos(phi0);
+  let y = r0 * Math.sin(phi0);
+  circles.push([x, y]);
+  table.insertRow([0, r0, v0, radToDeg(phi0)]);
+
+  // Loop over steps, integrating and updating everything
+  for (let i = 1; i < steps + 1; i++) {
+    // Compute the new state from the last state in orbit
+    let lastState = orbit[orbit.length - 1];
+    let newState = rk4Step(lastState[0], lastState[1], lastState[2], dtau, l);
+
+    // Stop if the radius is too small or too large
+    if (newState[0] < 2 || newState[0] > 1e6) {
       break;
     }
-    orbit.push([r, v, phi]);
+
+    // Push the new state
+    orbit.push(newState);
+
+    // Convert new state to canvas coordinates and update table
+    let r_i = newState[0];
+    let v_i = newState[1];
+    let phi_i = newState[2];
+    let cx = r_i * Math.cos(phi_i);
+    let cy = r_i * Math.sin(phi_i);
+    circles.push([cx, cy]);
+    table.insertRow([i / t_factor, r_i, v_i, radToDeg(phi_i)]);
+
+    // Perihelion detection: check if the previous state is a local minimum
+    // (using states: orbit[i-2], orbit[i-1], newState)
+    if (i >= 2) {
+      let r_before = orbit[i - 2][0];
+      let r_current = orbit[i - 1][0];
+      let r_next = newState[0];
+      if (r_before > r_current && r_current < r_next) {
+        // Record the perihelion using index i-1
+        let peri_phi = orbit[i - 1][2];
+        perihelions.push([i - 1, r_current, peri_phi]);
+
+        // If this is not the first perihelion, update the running sum
+        if (lastPerihelionPhi !== null) {
+          precessionSum += peri_phi - lastPerihelionPhi;
+          precessionCount++;
+        }
+        lastPerihelionPhi = peri_phi;
+      }
+    }
   }
-  return orbit;
+
+  // Compute mean precession if we detected at least one difference
+  if (precessionCount > 0) {
+    mean_precess = precessionSum / precessionCount - 2 * Math.PI;
+  } else {
+    mean_precess = 0;
+  }
 }
 
 // -----------------------------------
@@ -234,41 +271,8 @@ function repaint() {
   t = t_slider.value();
   l = (l_slider.value() / 10000) * l_c;
 
-  // Reset arrays
-  circles = [];
-  perihelions = [];
-  table.clear();
-
   // Integrate orbit from r_0, radial velocity = 0, phi_0=0
-  let orbit = integrateOrbit(r_0, v_0, phi_0, t, dtau, l);
-
-  // Fill circles and table
-  for (let i = 0; i < orbit.length; i++) {
-    let r_i = orbit[i][0];
-    let v_i = orbit[i][1];
-    let phi_i = orbit[i][2];
-    // let diff_i = initDiff(r_0, v_0, phi_0, r_i, v_i, phi_i);
-
-    // convert to canvas coords
-    let x = 5 * r_i * Math.cos(phi_i) + windowWidth / 2;
-    let y = -5 * r_i * Math.sin(phi_i) + windowHeight / 2;
-    circles.push([x, y]);
-    table.insertRow([i / t_factor, r_i, v_i, radToDeg(phi_i)]);
-  }
-
-  // Detect perihelions (r_{i-1} > r_i < r_{i+1})
-  for (let i = 1; i < orbit.length - 1; i++) {
-    let r_before = orbit[i - 1][0];
-    let r_now = orbit[i][0];
-    let r_after = orbit[i + 1][0];
-    let phi_now = orbit[i][2];
-    if (isPerihelion(r_before, r_now, r_after)) {
-      perihelions.push([i, r_now, phi_now]);
-    }
-  }
-
-  // Compute mean precession
-  mean_precess = meanPrecession(perihelions);
+  integrateOrbit(r_0, v_0, phi_0, t, dtau, l);
 
   // Reset animation index
   setDt();
@@ -302,7 +306,11 @@ function draw() {
     stroke(0);
     strokeWeight(3);
     for (let i = 0; i < dt; i++) {
-      line(circles[i][0], circles[i][1], circles[i + 1][0], circles[i + 1][1]);
+      let x1 = 5 * circles[i][0] + c_x;
+      let y1 = -5 * circles[i][1] + c_y;
+      let x2 = 5 * circles[i + 1][0] + c_x;
+      let y2 = -5 * circles[i + 1][1] + c_y;
+      line(x1, y1, x2, y2);
     }
 
     // Draw lines for perihelions
@@ -324,6 +332,7 @@ function draw() {
 
   // Draw central mass
   stroke(0);
+  strokeWeight(1.5);
   fill("black");
   circle(c_x, c_y, 15);
 
@@ -331,7 +340,9 @@ function draw() {
   stroke(0);
   fill("red");
   if (dt < circles.length) {
-    circle(circles[dt][0], circles[dt][1], 5);
+    let x = 5 * circles[dt][0] + c_x;
+    let y = -5 * circles[dt][1] + c_y;
+    circle(x, y, 5);
   }
 
   // Animation update
@@ -363,4 +374,6 @@ function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
   trajectoryDownloadButton.position(windowWidth - 220, windowHeight - 75);
   trajectoryPrecessionButton.position(windowWidth - 450, windowHeight - 75);
+  c_x = windowWidth / 2;
+  c_y = windowHeight / 2;
 }
