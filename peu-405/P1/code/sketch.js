@@ -2,7 +2,7 @@
 // Global variables
 // --------------------
 let l_factor = 7500;
-let t_factor = 1000;
+let t_factor = 500;
 let step_max = 4286;
 let speed_multiplier = 2;
 let w = 50;
@@ -19,7 +19,7 @@ let l = (l_factor / 10000) * l_c; // scaled angular momentum
 // Arrays and parameters for drawing & data storage
 let circles = [];
 let perihelions = [];
-let mean_precess = 0;
+let mean_precession = 0;
 let table = new TableManager(
   ["\u03C4 (\u03C4c)", "r (GM)", "v (GM)", "\u0278 (\u00B0)"],
   "tbl123",
@@ -27,7 +27,7 @@ let table = new TableManager(
 );
 
 // Animation controls
-let t_slider, r_slider, l_slider, s_slider, animate_checkbox;
+let dt_slider, t_slider, r_slider, l_slider, s_slider, animate_checkbox;
 let t = step_max;
 let dt = 0; // index for animation
 let c_x, c_y; // canvas center
@@ -70,7 +70,7 @@ function downloadPrecessionTable() {
   let newRow = t.addRow();
   newRow.set("\u03C4 (\u03C4c)", "mean precession (deg):");
   newRow.set("r (GM)", "");
-  newRow.set("\u0278 (\u00B0)", radToDeg(mean_precess));
+  newRow.set("\u0278 (\u00B0)", radToDeg(mean_precession));
 
   saveTable(t, "schwarzschild_orbit_precession.csv");
 }
@@ -112,7 +112,8 @@ function derivatives(r, v, phi, l) {
 }
 
 // 2) One RK4 step
-function rk4Step(r, v, phi, dtau, l) {
+function rk4Step(state, dtau, l) {
+  let [r, v, phi] = state;
   let [dr1, dv1, dphi1] = derivatives(r, v, phi, l);
 
   let r2 = r + 0.5 * dtau * dr1;
@@ -139,79 +140,131 @@ function rk4Step(r, v, phi, dtau, l) {
 
 // 3) Integrate for `steps` iterations
 function integrateOrbit(r0, v0, phi0, steps, dtau, l) {
-  let orbit = [];
-  perihelions = []; // reset perihelion array
-  table.clear(); // clear table before starting
-  circles = []; // clear circles array
+  // Clear previous data
+  perihelions.length = 0;
+  table.clear(); // We'll repopulate later
+  circles.length = 0;
 
-  // Variables for on-the-fly mean precession computation
+  // For period estimation, record steps where orbit returns close to initial state
+  let periodSteps = [];
+  const tolerance_r = 0.5; // tolerance in r (GM)
+  const tolerance_phi = Math.PI / 180; // tolerance in phi (radians)
+  const tolerance_v = 0.02; // tolerance in velocity (customize as needed)
+
+  let minSeparation = 100; // minimum # steps between successive detections
+
+  // For on-the-fly mean precession
   let precessionSum = 0;
   let precessionCount = 0;
-  let lastPerihelionPhi = null; // will store the last detected perihelion's phi
+  let lastPerihelionPhi = null;
 
-  // Push the initial state
-  orbit.push([r0, v0, phi0]);
-  let x = r0 * Math.cos(phi0);
-  let y = r0 * Math.sin(phi0);
-  circles.push([x, y]);
-  table.insertRow([0, r0, v0, radToDeg(phi0)]);
+  // Precompute constants
+  const TWO_PI = 2 * Math.PI;
 
-  // Loop over steps, integrating and updating everything
-  for (let i = 1; i < steps + 1; i++) {
-    // Compute the new state from the last state in orbit
-    let lastState = orbit[orbit.length - 1];
-    let newState = rk4Step(lastState[0], lastState[1], lastState[2], dtau, l);
+  // Helper: measure angle difference modulo 2π
+  function angleDiff(phi1, phi2) {
+    let dphi = (phi1 - phi2) % TWO_PI;
+    if (dphi > Math.PI) dphi -= TWO_PI;
+    if (dphi < -Math.PI) dphi += TWO_PI;
+    return Math.abs(dphi);
+  }
 
-    // Stop if the radius is too small or too large
-    if (newState[0] < 2 || newState[0] > 1e6) {
+  // Helper: convert (r, phi) → Cartesian
+  function toCanvasCoords(r, phi) {
+    return [r * Math.cos(phi), r * Math.sin(phi)];
+  }
+
+  // 1) Compute initial states
+  let state0 = [r0, v0, phi0];
+  let state1 = rk4Step(state0, dtau, l);
+  let state2 = rk4Step(state1, dtau, l);
+
+  // 2) Push initial states into table and circle arrays
+  let [x0, y0] = toCanvasCoords(state0[0], state0[2]);
+  let [x1, y1] = toCanvasCoords(state1[0], state1[2]);
+  let [x2, y2] = toCanvasCoords(state2[0], state2[2]);
+
+  circles.push([x0, y0], [x1, y1], [x2, y2]);
+  table.insertRow([0 / t_factor, state0[0], state0[1], radToDeg(state0[2])]);
+  table.insertRow([1 / t_factor, state1[0], state1[1], radToDeg(state1[2])]);
+  table.insertRow([2 / t_factor, state2[0], state2[1], radToDeg(state2[2])]);
+
+  // 3) Keep sliding window of last 3 states for perihelion detection
+  let prev2 = state0;
+  let prev1 = state1;
+  let current = state2;
+
+  // For period detection
+  periodSteps.push(0);
+  let lastPeriodIndex = 0;
+
+  // 4) Main integration loop
+  for (let i = 3; i < steps + 1; i++) {
+    // Step forward using RK4
+    let nextState = rk4Step(current, dtau, l);
+
+    // Slide the window
+    prev2 = prev1;
+    prev1 = current;
+    current = nextState;
+
+    // Quick radius check to avoid nonsensical extremes
+    let rCurr = current[0];
+    if (rCurr < 2 || rCurr > 1e6) {
       break;
     }
 
-    // Push the new state
-    orbit.push(newState);
-
-    // Convert new state to canvas coordinates and update table
-    let r_i = newState[0];
-    let v_i = newState[1];
-    let phi_i = newState[2];
-    let cx = r_i * Math.cos(phi_i);
-    let cy = r_i * Math.sin(phi_i);
+    // Convert to canvas
+    let [cx, cy] = toCanvasCoords(rCurr, current[2]);
     circles.push([cx, cy]);
-    table.insertRow([i / t_factor, r_i, v_i, radToDeg(phi_i)]);
+    table.insertRow([
+      i / t_factor,
+      current[0],
+      current[1],
+      radToDeg(current[2]),
+    ]);
+    // Perihelion detection (local minimum in r)
+    if (prev2[0] > prev1[0] && prev1[0] < rCurr) {
+      perihelions.push([i - 1, prev1[0], prev1[2]]);
+      if (lastPerihelionPhi !== null) {
+        precessionSum += prev1[2] - lastPerihelionPhi;
+        precessionCount++;
+      }
+      lastPerihelionPhi = prev1[2];
+    }
 
-    // Perihelion detection: check if the previous state is a local minimum
-    // (using states: orbit[i-2], orbit[i-1], newState)
-    if (i >= 2) {
-      let r_before = orbit[i - 2][0];
-      let r_current = orbit[i - 1][0];
-      let r_next = newState[0];
-      if (r_before > r_current && r_current < r_next) {
-        // Record the perihelion using index i-1
-        let peri_phi = orbit[i - 1][2];
-        perihelions.push([i - 1, r_current, peri_phi]);
+    // Period detection: check if r, v, and phi are each close to their initial values
+    if (i - lastPeriodIndex >= minSeparation) {
+      let rError = Math.abs(rCurr - r0);
+      let vError = Math.abs(current[1] - v0);
+      let phiError = angleDiff(current[2], phi0);
 
-        // If this is not the first perihelion, update the running sum
-        if (lastPerihelionPhi !== null) {
-          precessionSum += peri_phi - lastPerihelionPhi;
-          precessionCount++;
-        }
-        lastPerihelionPhi = peri_phi;
+      // Must satisfy *all three* thresholds
+      if (
+        rError <= tolerance_r &&
+        vError <= tolerance_v &&
+        phiError <= tolerance_phi
+      ) {
+        periodSteps.push(i);
+        lastPeriodIndex = i;
       }
     }
   }
 
-  // Compute mean precession if we detected at least one difference
+  // 5) If we want to compute mean precession
   if (precessionCount > 0) {
-    mean_precess = precessionSum / precessionCount - 2 * Math.PI;
+    mean_precession = precessionSum / precessionCount - TWO_PI;
   } else {
-    mean_precess = 0;
+    mean_precession = 0;
   }
+
+  console.log("Detected period steps:", periodSteps);
 }
 
 // -----------------------------------
 // p5.js UI Setup
 // -----------------------------------
-let trajectoryDownloadButton, trajectoryPrecessionButton;
+let trajectoryDownloadButton, PrecessionDownloadButton;
 
 function setup() {
   createCanvas(windowWidth, windowHeight);
@@ -227,32 +280,36 @@ function setup() {
   l_slider.position(10, 60);
   l_slider.input(repaint);
 
+  dt_slider = createSlider(100, 2000, t_factor, 100);
+  dt_slider.position(10, 110);
+  dt_slider.input(repaint);
+
   t_slider = createSlider(10, 10000, step_max);
-  t_slider.position(10, 110);
+  t_slider.position(10, 160);
   t_slider.input(repaint);
 
   s_slider = createSlider(1, 100, speed_multiplier);
-  s_slider.position(10, 160);
+  s_slider.position(10, 210);
   s_slider.input(update_speed);
 
   // Buttons
   trajectoryDownloadButton = createButton("Download trajectory data");
   trajectoryDownloadButton.mousePressed(downloadTrajectoryTable);
-  trajectoryDownloadButton.position(windowWidth - 220, windowHeight - 75);
+  trajectoryDownloadButton.position(windowWidth - 210, windowHeight - 145);
   trajectoryDownloadButton.addClass("download-btn");
 
-  trajectoryPrecessionButton = createButton("Download precession data");
-  trajectoryPrecessionButton.mousePressed(downloadPrecessionTable);
-  trajectoryPrecessionButton.position(windowWidth - 450, windowHeight - 75);
-  trajectoryPrecessionButton.addClass("download-btn");
+  PrecessionDownloadButton = createButton("Download precession data");
+  PrecessionDownloadButton.mousePressed(downloadPrecessionTable);
+  PrecessionDownloadButton.position(windowWidth - 220, windowHeight - 75);
+  PrecessionDownloadButton.addClass("download-btn");
 
   let tButton = createButton("reset");
-  tButton.position(10, 260);
+  tButton.position(10, 360);
   tButton.mousePressed(setDt);
   tButton.addClass("t-btn");
 
   animate_checkbox = createCheckbox("Animate");
-  animate_checkbox.position(10, 310);
+  animate_checkbox.position(10, 410);
   animate_checkbox.addClass("a-chk");
 
   // Initial orbit
@@ -269,6 +326,8 @@ function repaint() {
   phi_0 = 0;
   v_0 = 0;
   t = t_slider.value();
+  t_factor = dt_slider.value();
+  dtau = tau_c / t_factor;
   l = (l_slider.value() / 10000) * l_c;
 
   // Integrate orbit from r_0, radial velocity = 0, phi_0=0
@@ -357,23 +416,28 @@ function draw() {
   textSize(24);
   text("r = " + r_slider.value() + " GM", 180, 30);
   text("l = " + l_slider.value() / 10000 + " lc(50)", 180, 80);
-  text("\u03C4 = " + t_slider.value() / t_factor + " tc(50)", 180, 130);
-  text(s_slider.value() + "x", 180, 180);
+  text("d\u03C4 = " + dt_slider.value() + " 1/tc(50)", 180, 130);
   text(
-    "mean precession \u2248 " + radToDeg(mean_precess).toFixed(2) + "\u00B0",
-    10,
-    230
+    "\u03C4 max = " + (t_slider.value() / t_factor).toFixed(4) + " tc(50)",
+    180,
+    180
   );
-
+  text(s_slider.value() + "x", 180, 230);
+  text("\u03C4 = " + (dt / t_factor).toFixed(4), 10, 280);
+  text(
+    "mean precession \u2248 " + radToDeg(mean_precession).toFixed(2) + "\u00B0",
+    10,
+    330
+  );
   stroke("grey");
-  textSize(32);
-  text("Schwarzschild Orbits (RK4)", 20, windowHeight - 60);
+  textSize(28);
+  text("Schwarzschild Orbits (RK4)", 20, windowHeight - 40);
 }
 
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
-  trajectoryDownloadButton.position(windowWidth - 220, windowHeight - 75);
-  trajectoryPrecessionButton.position(windowWidth - 450, windowHeight - 75);
+  trajectoryDownloadButton.position(windowWidth - 210, windowHeight - 145);
+  PrecessionDownloadButton.position(windowWidth - 220, windowHeight - 75);
   c_x = windowWidth / 2;
   c_y = windowHeight / 2;
 }
